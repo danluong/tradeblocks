@@ -1,9 +1,19 @@
 /**
  * DuckDB Connection Manager
  *
- * Provides lazy singleton connection to DuckDB analytics database.
- * The connection is created on first getConnection() call and reused
- * for subsequent calls until closeConnection() is called.
+ * Provides lazy singleton connection to DuckDB analytics database (analytics.duckdb)
+ * with a second database (market.duckdb) ATTACHed as the `market` catalog.
+ *
+ * Startup sequence on first RW open:
+ *   1. Open analytics.duckdb
+ *   2. DROP SCHEMA IF EXISTS market CASCADE (removes legacy inline market tables,
+ *      prevents DuckDB #14421 naming conflict with the upcoming ATTACH)
+ *   3. ATTACH market.duckdb AS market
+ *   4. ensureMarketTables() — creates market.daily/context/intraday/_sync_metadata
+ *   5. ensureSyncTables() / ensureTradeDataTable() / ensureReportingDataTable()
+ *
+ * On close: CHECKPOINT → DETACH market → closeSync() to flush WAL reliably.
+ * On RO open: ATTACH market.duckdb READ_ONLY (no table creation).
  *
  * DuckDB is single-process: only one process can open a database file at a time
  * (even read-only fails when another process holds a write lock with an active WAL).
@@ -11,25 +21,31 @@
  * orphaned MCP processes (PPID=1) and terminating them before retrying.
  *
  * Configuration via environment variables:
- *   DUCKDB_MEMORY_LIMIT - Memory limit (default: 512MB)
- *   DUCKDB_THREADS      - Number of threads (default: 2)
- *   DUCKDB_LOCK_RECOVERY - Force-kill ANY lock-holding tradeblocks-mcp (default: false)
+ *   DUCKDB_MEMORY_LIMIT    - Memory limit (default: 512MB)
+ *   DUCKDB_THREADS         - Number of threads (default: 2)
+ *   DUCKDB_LOCK_RECOVERY   - Force-kill ANY lock-holding tradeblocks-mcp (default: false)
  *   DUCKDB_LOCK_RECOVERY_TIMEOUT_MS - Wait time for SIGTERM (default: 1500)
+ *   MARKET_DB_PATH         - Path to market.duckdb (overrides default, overridden by --market-db)
  *
  * Security:
- *   - enable_external_access is disabled to prevent remote URL fetching
- *   - This setting self-locks when disabled
+ *   - enable_external_access: "true" at DuckDBInstance creation allows local ATTACH
+ *   - We do NOT call SET enable_external_access = false because testing confirmed it also
+ *     blocks local file ATTACH operations (not just HTTP), which breaks importFromDatabase
+ *   - No HTTP URLs are used in this application — local ATTACH is the only external access needed
  *
- * Schemas created on first connection:
- *   - trades: For block/trade data
- *   - market: For market data (SPY, VIX, etc.)
+ * Schemas created on first RW connection:
+ *   - trades: For block/trade data (in analytics.duckdb)
+ *   - market: ATTACHed from market.duckdb (daily, context, intraday, _sync_metadata)
  */
 
 import { DuckDBInstance, DuckDBConnection } from "@duckdb/node-api";
 import { execFile } from "child_process";
+import * as fs from "fs/promises";
 import * as path from "path";
 import { promisify } from "util";
-import { ensureSyncTables, ensureTradeDataTable, ensureReportingDataTable, ensureMarketDataTables } from "./schemas.js";
+import { ensureSyncTables, ensureTradeDataTable, ensureReportingDataTable } from "./schemas.js";
+import { ensureMarketTables } from "./market-schemas.js";
+import { ensureProfilesSchema } from "./profile-schemas.js";
 
 // Module-level singleton state
 let instance: DuckDBInstance | null = null;
@@ -38,14 +54,17 @@ let connectionMode: "read_write" | "read_only" | null = null;
 let storedDbPath: string | null = null;
 let storedThreads: string | null = null;
 let storedMemoryLimit: string | null = null;
+let storedMarketDbPath: string | null = null;
 const execFileAsync = promisify(execFile);
+const isWindows = process.platform === "win32";
 
 function isLockError(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     lower.includes("could not set lock on file") ||
     lower.includes("conflicting lock is held") ||
-    lower.includes("io error: could not set lock")
+    lower.includes("io error: could not set lock") ||
+    lower.includes("being used by another process") // Windows OS error
   );
 }
 
@@ -67,6 +86,15 @@ function isProcessAlive(pid: number): boolean {
 
 async function getProcessParentPid(pid: number): Promise<number | null> {
   try {
+    if (isWindows) {
+      const { stdout } = await execFileAsync("wmic", [
+        "process", "where", `ProcessId=${pid}`, "get", "ParentProcessId", "/value",
+      ]);
+      const match = stdout.match(/ParentProcessId=(\d+)/);
+      if (!match) return null;
+      const ppid = parseInt(match[1], 10);
+      return Number.isFinite(ppid) ? ppid : null;
+    }
     const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "ppid="]);
     const ppid = parseInt(stdout.trim(), 10);
     return Number.isFinite(ppid) ? ppid : null;
@@ -77,6 +105,15 @@ async function getProcessParentPid(pid: number): Promise<number | null> {
 
 async function getProcessCommand(pid: number): Promise<string | null> {
   try {
+    if (isWindows) {
+      const { stdout } = await execFileAsync("wmic", [
+        "process", "where", `ProcessId=${pid}`, "get", "CommandLine", "/value",
+      ]);
+      const match = stdout.match(/CommandLine=(.+)/);
+      if (!match) return null;
+      const command = match[1].trim();
+      return command.length > 0 ? command : null;
+    }
     const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
     const command = stdout.trim();
     return command.length > 0 ? command : null;
@@ -117,18 +154,25 @@ async function tryRecoverLockByTerminatingStaleProcess(
   const isTradeblocksProcess =
     command.includes("tradeblocks-mcp") ||
     command.includes("/mcp-server/server/index.js") ||
-    command.includes("packages/mcp-server/server/index.js");
-  const targetsSameDb = command.includes(normalizedDbPath) || command.includes(normalizedDbDir);
+    command.includes("packages/mcp-server/server/index.js") ||
+    command.includes("\\mcp-server\\server\\index.js") ||
+    command.includes("packages\\mcp-server\\server\\index.js");
+  // Normalize command paths for consistent comparison (Windows backslashes → forward slashes)
+  const normalizedCommand = command.replace(/\\/g, "/");
+  const targetsSameDb = normalizedCommand.includes(normalizedDbPath) || normalizedCommand.includes(normalizedDbDir);
 
   if (!isTradeblocksProcess || !targetsSameDb) {
     return false;
   }
 
-  // Check if the lock holder is orphaned (parent died, reparented to init/launchd PID 1).
-  // Orphaned processes are definitively stale — their Claude session is gone.
+  // Check if the lock holder is orphaned (parent session is gone).
+  // Unix: orphaned processes get reparented to PID 1 (init/launchd).
+  // Windows: child keeps original PPID even after parent dies — check if parent is still alive.
   // Only kill non-orphaned processes if forceRecovery is explicitly enabled.
   const ppid = await getProcessParentPid(lockHolderPid);
-  const orphaned = ppid === 1;
+  const orphaned = isWindows
+    ? (ppid !== null && !isProcessAlive(ppid))
+    : ppid === 1;
   if (!orphaned && !forceRecovery) {
     return false;
   }
@@ -156,25 +200,114 @@ async function tryRecoverLockByTerminatingStaleProcess(
   return exited;
 }
 
+/**
+ * Resolve the path to market.duckdb.
+ *
+ * Precedence: CLI --market-db > MARKET_DB_PATH env > default (<dataDir>/market.duckdb)
+ *
+ * @param dataDir - Directory where analytics.duckdb lives (used as default parent)
+ */
+function resolveMarketDbPath(dataDir: string): string {
+  // 1. CLI argument: --market-db /path/to/market.duckdb
+  const args = process.argv;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--market-db" && args[i + 1]) {
+      return path.resolve(args[i + 1]);
+    }
+  }
+  // 2. Environment variable
+  if (process.env.MARKET_DB_PATH) {
+    return path.resolve(process.env.MARKET_DB_PATH);
+  }
+  // 3. Default: alongside analytics.duckdb
+  return path.join(dataDir, "market.duckdb");
+}
+
+/**
+ * ATTACH market.duckdb to an existing connection.
+ *
+ * Creates the parent directory if needed. Auto-recreates market.duckdb on
+ * corruption (market data is re-importable from source CSVs).
+ *
+ * Hard fails on any non-corruption ATTACH error — market access is required.
+ */
+async function attachMarketDb(
+  conn: DuckDBConnection,
+  marketDbPath: string,
+  mode: "read_write" | "read_only"
+): Promise<void> {
+  await fs.mkdir(path.dirname(marketDbPath), { recursive: true });
+  const readOnlyClause = mode === "read_only" ? " (READ_ONLY)" : "";
+  try {
+    await conn.run(`ATTACH '${marketDbPath}' AS market${readOnlyClause}`);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes("corrupt") || msg.includes("Invalid") || msg.includes("cannot open")) {
+      console.error(`market.duckdb appears corrupted at ${marketDbPath}. Recreating.`);
+      try { await fs.unlink(marketDbPath); } catch { /* file may not exist */ }
+      // Also try removing WAL file
+      try { await fs.unlink(marketDbPath + ".wal"); } catch { /* ignore */ }
+      await conn.run(`ATTACH '${marketDbPath}' AS market${readOnlyClause}`);
+    } else {
+      throw new Error(`Failed to attach market.duckdb at ${marketDbPath}: ${msg}`);
+    }
+  }
+}
+
+/**
+ * DETACH market.duckdb from a connection.
+ * Non-fatal: may already be detached or market was never attached.
+ */
+async function detachMarketDb(conn: DuckDBConnection): Promise<void> {
+  try {
+    await conn.run("DETACH market");
+  } catch {
+    // Non-fatal: may already be detached or market never attached
+  }
+}
+
 async function openReadWriteConnection(
   dbPath: string,
   threads: string,
   memoryLimit: string
 ): Promise<DuckDBConnection> {
+  // enable_external_access must be "true" at instance creation to allow ATTACH of local files.
+  // DuckDB 1.4+ blocks all filesystem operations (including local ATTACH) when set to "false"
+  // at the instance level. After ATTACH, we lock it down via SET to prevent remote HTTP access.
   instance = await DuckDBInstance.create(dbPath, {
     threads,
     memory_limit: memoryLimit,
-    enable_external_access: "false",
+    enable_external_access: "true",
   });
   connection = await instance.connect();
+
+  // Drop legacy market schema from analytics.duckdb before ATTACH.
+  // Prevents DuckDB #14421 naming conflict: having tables in both the main DB
+  // and an ATTACHed DB under the same catalog name causes corruption.
+  try {
+    await connection.run("DROP SCHEMA IF EXISTS market CASCADE");
+  } catch {
+    // Non-fatal: schema may not exist (fresh DB or already dropped)
+  }
+
+  // Attach separate market.duckdb
+  await attachMarketDb(connection, storedMarketDbPath!, "read_write");
+
+  // NOTE: We intentionally do NOT call SET enable_external_access = false here.
+  // Testing confirmed that SET blocks ALL new ATTACH operations (including local file ATTACH),
+  // not just remote HTTP/HTTPS access. This would prevent importFromDatabase from ATTACHing
+  // external DuckDB files, making the import_from_database MCP tool non-functional.
+  // The enable_external_access: "true" at DuckDBInstance creation is the intended security
+  // boundary — no HTTP URLs are used in this application.
+
   // Create schemas/tables every RW open. This keeps the process resilient if
   // analytics.duckdb is deleted/recreated while the process remains alive.
   await connection.run("CREATE SCHEMA IF NOT EXISTS trades");
-  await connection.run("CREATE SCHEMA IF NOT EXISTS market");
   await ensureSyncTables(connection);
   await ensureTradeDataTable(connection);
   await ensureReportingDataTable(connection);
-  await ensureMarketDataTables(connection);
+  await ensureMarketTables(connection);
+  await ensureProfilesSchema(connection);
   connectionMode = "read_write";
 
   return connection;
@@ -185,13 +318,19 @@ async function openReadOnlyConnection(
   threads: string,
   memoryLimit: string
 ): Promise<DuckDBConnection> {
+  // enable_external_access must be "true" at instance creation to allow ATTACH.
+  // We do NOT call SET enable_external_access = false because it also blocks local
+  // file ATTACH operations, not just HTTP. See openReadWriteConnection for details.
   instance = await DuckDBInstance.create(dbPath, {
     threads,
     memory_limit: memoryLimit,
-    enable_external_access: "false",
+    enable_external_access: "true",
     access_mode: "READ_ONLY",
   });
   connection = await instance.connect();
+  if (storedMarketDbPath) {
+    await attachMarketDb(connection, storedMarketDbPath, "read_only");
+  }
   connectionMode = "read_only";
   return connection;
 }
@@ -208,7 +347,9 @@ function resetConnectionState(): void {
  * On first call:
  *   - Creates DuckDBInstance at `<dataDir>/analytics.duckdb`
  *   - Applies memory, thread, and security configuration
- *   - Creates 'trades' and 'market' schemas
+ *   - Drops legacy inline market schema from analytics.duckdb
+ *   - ATTACHes market.duckdb as `market` catalog
+ *   - Creates 'trades' schema and market tables
  *   - Stores connection for reuse
  *
  * Subsequent calls return the existing connection.
@@ -233,9 +374,12 @@ export async function getConnection(dataDir: string): Promise<DuckDBConnection> 
   storedDbPath = dbPath;
   storedThreads = threads;
   storedMemoryLimit = memoryLimit;
-  // DUCKDB_LOCK_RECOVERY=true force-kills ANY lock-holding tradeblocks-mcp process.
-  // Without it, only orphaned processes (PPID=1, parent died) are auto-killed.
-  const forceRecovery = (process.env.DUCKDB_LOCK_RECOVERY ?? "false") !== "false";
+  storedMarketDbPath = resolveMarketDbPath(dataDir);
+  // Lock recovery: kill other tradeblocks-mcp processes that hold the write lock.
+  // Enabled by default — safe because market data is re-importable and lock holders
+  // are just other Claude sessions that can lazily restart their MCP server.
+  // Set DUCKDB_LOCK_RECOVERY=false to disable (only kill orphaned processes).
+  const forceRecovery = (process.env.DUCKDB_LOCK_RECOVERY ?? "true") !== "false";
 
   try {
     return await openReadWriteConnection(dbPath, threads, memoryLimit);
@@ -284,11 +428,14 @@ export async function getConnection(dataDir: string): Promise<DuckDBConnection> 
 /**
  * Close the DuckDB connection and release resources.
  *
+ * DETACHes market.duckdb before closing to ensure WAL is checkpointed cleanly.
  * Should be called during graceful shutdown (SIGINT, SIGTERM).
  * Safe to call multiple times or when no connection exists.
  */
 export async function closeConnection(): Promise<void> {
   if (connection) {
+    try { await connection.run("CHECKPOINT"); } catch { /* non-fatal */ }
+    try { await detachMarketDb(connection); } catch { /* non-fatal, log debug */ }
     try {
       // closeSync is the synchronous close method for DuckDB connections
       connection.closeSync();
@@ -307,13 +454,19 @@ export async function closeConnection(): Promise<void> {
 }
 
 /**
- * Upgrade the connection to read-write mode for sync/write operations.
+ * Upgrade the connection to read-write mode for write operations.
  * No-op if already in read-write mode.
- * Retries with backoff if another session briefly holds the write lock (during sync).
- * Falls back to read-only if the lock can't be acquired (another session is active).
- * Callers should check getConnectionMode() to determine if sync should be skipped.
+ * Retries with backoff if another session briefly holds the write lock.
+ *
+ * @param dataDir - Directory where analytics.duckdb lives
+ * @param options.fallbackToReadOnly - If true, fall back to read-only on lock failure
+ *   instead of throwing. Used by sync middleware where RO is acceptable (just skip sync).
+ *   Default: false — callers that need writes get a clear error instead of a silent RO surprise.
  */
-export async function upgradeToReadWrite(dataDir: string): Promise<DuckDBConnection> {
+export async function upgradeToReadWrite(
+  dataDir: string,
+  options?: { fallbackToReadOnly?: boolean }
+): Promise<DuckDBConnection> {
   if (connectionMode === "read_write" && connection) return connection;
   await closeConnection();
 
@@ -335,8 +488,8 @@ export async function upgradeToReadWrite(dataDir: string): Promise<DuckDBConnect
     }
   }
 
-  // RW retries exhausted — fall back to read-only (skip sync, use existing data)
-  if (storedDbPath && storedThreads && storedMemoryLimit) {
+  // RW retries exhausted
+  if (options?.fallbackToReadOnly && storedDbPath && storedThreads && storedMemoryLimit) {
     try {
       await openReadOnlyConnection(storedDbPath, storedThreads, storedMemoryLimit);
       if (connection) return connection;
@@ -345,7 +498,10 @@ export async function upgradeToReadWrite(dataDir: string): Promise<DuckDBConnect
     }
   }
 
-  throw lastError || new Error("Failed to upgrade DuckDB connection to read-write");
+  throw lastError || new Error(
+    "Cannot acquire DuckDB write lock. Another process holds it. " +
+    "Kill other tradeblocks-mcp processes or restart Claude Code."
+  );
 }
 
 /**

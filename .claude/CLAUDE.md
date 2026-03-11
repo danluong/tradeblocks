@@ -105,7 +105,7 @@ Rules for type 1 (trade dates from CSVs):
 - **DON'T**: Use `toLocaleDateString()` with explicit `timeZone` on these dates — this re-interprets the local-midnight date in a different timezone and can shift it by a day.
 - **DON'T**: Use `.toISOString().split("T")[0]` on these dates — this converts to UTC first and can shift the calendar date.
 
-**Market Data Lookahead Rules (MCP Server)**: When joining trades with `market.spx_daily`, close-derived fields (44 fields including `Trend_Score`, `RSI_14`, `VIX_Close`, `Vol_Regime`, `Return_5D`) are only known after market close and MUST use `LAG()` to get the prior trading day's value. Use `buildLookaheadFreeQuery()` from `utils/field-timing.ts`. Open-known fields (8 fields: `Gap_Pct`, `VIX_Open`, `Prior_Close`, etc.) and static fields (3: `Day_of_Week`, `Month`, `Is_Opex`) are safe to use same-day. See `utils/schema-metadata.ts` for the authoritative field classification.
+**Market Data Lookahead Rules (MCP Server)**: When joining trades with market data, `buildLookaheadFreeQuery()` from `utils/field-timing.ts` JOINs `market.daily` and `market.context` before applying `LAG()`. Close-derived fields (38 fields including `RSI_14`, `VIX_Close`, `Vol_Regime`, `BB_Width`, `Opening_Drive_Strength`) are only known after market close and MUST use `LAG()` to get the prior trading day's value. Open-known fields (10 fields: `Gap_Pct`, `VIX_Open`, `VIX_RTH_Open`, `Prior_Close`, `Prior_Range_vs_ATR`, etc.) and static fields (3: `Day_of_Week`, `Month`, `Is_Opex`) are safe to use same-day. See `utils/schema-metadata.ts` for the authoritative field classification.
 
 **Date Handling**: Trades use separate `dateOpened` (Date object) and `timeOpened` (string) fields. When processing CSVs, parse dates carefully and maintain consistency with legacy format.
 
@@ -145,11 +145,15 @@ When adding new metrics, calculations, or chart data to the UI, **consider wheth
 - `src/tools/performance.ts` - Chart data, period returns, backtest vs actual
 - `src/tools/analysis.ts` - Monte Carlo, walk-forward, correlations
 - `src/tools/reports.ts` - Custom queries, field statistics
-- `src/tools/market-data.ts` - Market regime analysis, filter suggestions, ORB calculation (all via DuckDB)
+- `src/tools/market-data.ts` - Market regime analysis, filter suggestions, ORB calculation, trade enrichment
+- `src/tools/market-imports.ts` - import_market_csv, import_from_database
+- `src/tools/market-enrichment.ts` - enrich_market_data
+- `src/tools/profiles.ts` - Strategy profile CRUD (profile_strategy, get_strategy_profile, list_profiles, delete_profile)
+- `src/tools/profile-analysis.ts` - Structure-aware analysis (analyze_structure_fit, validate_entry_filters, portfolio_structure_map)
 
 ### Using MCP Tools Natively
 
-The TradeBlocks MCP server is connected via `npm link`, making tools available directly as `mcp__tradeblocks__*`. Use these native tools instead of CLI commands for querying portfolio data.
+The TradeBlocks MCP server is configured in `.mcp.json` to run directly from the built server entry point (`packages/mcp-server/server/index.js`), making tools available as `mcp__tradeblocks__*`. After changing MCP server source code, run `npm run build` in `packages/mcp-server/` and restart the Claude Code session for changes to take effect.
 
 **Available tools** (use `ToolSearch` to load before first use):
 - `mcp__tradeblocks__list_blocks` - List all portfolio blocks (START HERE)
@@ -167,9 +171,10 @@ The TradeBlocks MCP server is connected via `npm link`, making tools available d
 ```
 
 **Market data access:**
-- All market data is in DuckDB: `SELECT ... FROM market.spx_daily`, `market.spx_15min`, `market.vix_intraday`
+- Market data in separate `market.duckdb`: `market.daily`, `market.context`, `market.intraday`
+- Import via `mcp__tradeblocks__import_market_csv`, enrich via `mcp__tradeblocks__enrich_market_data`
 - Use `mcp__tradeblocks__run_sql` or `mcp__tradeblocks__describe_database` for schema discovery
-- Dedicated tools: `analyze_regime_performance`, `suggest_filters`, `calculate_orb` (all DuckDB-backed)
+- Dedicated tools: `analyze_regime_performance`, `suggest_filters`, `calculate_orb`, `enrich_trades`
 
 ### Trading Calendar Data Model
 
@@ -317,9 +322,9 @@ GSD plans MUST include a test task for any new utility module. If a plan creates
 4. **After subagent work:** Always run `npm run typecheck` before final commit
 
 5. **Version management:**
-   - Bump MCP server version in `packages/mcp-server/package.json` when MCP functionality changes (new tools, API changes, bug fixes)
-   - Version bumps can happen mid-milestone if MCP changes are shipped
-   - Follow semver: patch for fixes, minor for new features, major for breaking changes
+   - MCP server version (`packages/mcp-server/package.json`), git tags, and GSD milestones all use the same version number
+   - Bump MCP server version to match the milestone version at milestone completion (e.g., milestone v2.1 → package version 2.1.0 → git tag v2.1)
+   - Mid-milestone patch bumps use the milestone version with patch increments (e.g., 2.1.1, 2.1.2)
 
 6. **Milestone completion checklist:**
    - Archive milestone to `.planning/milestones/`
